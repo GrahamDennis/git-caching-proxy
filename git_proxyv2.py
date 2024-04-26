@@ -3,21 +3,42 @@ from dataclasses import dataclass
 from enum import Enum
 import gzip
 import logging
+from pathlib import Path
 import subprocess
-from typing import Annotated, Optional, Sequence
+from typing import Annotated, Optional, Sequence, Type
 from fastapi.responses import Response, StreamingResponse
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict, YamlConfigSettingsSource
 from starlette.convertors import Convertor, register_url_convertor
 import os
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(yaml_file='config.yaml')
+
+    git_path: str = "/usr/bin/git"
+    namespaces: dict[str, str] = {}
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: Type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (YamlConfigSettingsSource(settings_cls),)
+
+
+settings = Settings()
 
 NO_CACHE_HEADERS = {
     "Expires": "Fri, 01 Jan 1980 00:00:00 GMT",
     "Pragma": "no-cache",
     "Cache-Control": "no-cache, max-age=0, must-revalidate",
 }
-GIT_PATH="/usr/bin/git"
-GIT_PROJECT_ROOT="/Users/graham/Developer/github.com"
+REF_PREFIX = b'ref-prefix '
 
 logger = logging.getLogger(__name__)
 
@@ -71,34 +92,39 @@ def parse_pkt_lines(data: bytes) -> tuple[list[PktLine], bytes]:
             pkts.append(PktLineData(data[offset + 4:(offset + pkt_length)]))
             offset += pkt_length
 
-def path_to_repo(repo: str) -> str:
-    return f'{GIT_PROJECT_ROOT}/{repo}'
-
-async def git_init_if_required(repo: str, repo_path: str) -> None:
-    if os.path.isdir(repo_path):
+async def git_init_if_required(*, remote_repo: str, local_repo: Path) -> None:
+    if os.path.isdir(local_repo):
         return
     git_clone_process = await asyncio.create_subprocess_exec(
-        GIT_PATH,
+        settings.git_path,
         "clone",
         '--quiet',
         '--mirror',
         '--single-branch',
-        f'git@github.com:{repo}',
-        repo_path,
+        remote_repo,
+        local_repo.as_posix(),
     )
     git_clone_return_code = await git_clone_process.wait()
     if not git_clone_return_code == 0:
         raise Exception(f"git clone failed with return code {git_clone_return_code}")
 
+def get_local_repo(namespace: str, repo: str) -> Path:
+    return Path('var/data', namespace, repo)
 
 
-@app.get("/github.com/{repo:git_repo}/info/refs")
-async def git_info_refs(repo: str, service: Optional[bytes] = None) -> Response:
+def get_remote_repo(namespace: str, repo: str) -> str:
+    remote_repo_prefix = settings.namespaces[namespace]
+    return remote_repo_prefix + repo
+
+
+@app.get("/{namespace}/{repo:git_repo}/info/refs")
+async def git_info_refs(namespace: str, repo: str, service: Optional[bytes] = None) -> Response:
     if not service == b'git-upload-pack':
         raise HTTPException(status_code=400, detail=f"Unsupported service '{service}'")
-    repo_path = path_to_repo(repo)
-    await git_init_if_required(repo, repo_path)
-    return await proxy_to_git("upload-pack", "--http-backend-info-refs", repo_path)
+    local_repo = get_local_repo(namespace, repo)
+    remote_repo = get_remote_repo(namespace, repo)
+    await git_init_if_required(remote_repo=remote_repo, local_repo=local_repo)
+    return await proxy_to_git("upload-pack", "--http-backend-info-refs", local_repo)
 
 
 async def decode_body(request: Request) -> bytes:
@@ -110,7 +136,7 @@ async def decode_body(request: Request) -> bytes:
 
 async def proxy_to_git(service_name: str, *arguments: str) -> Response:
     git_process = await asyncio.create_subprocess_exec(
-        GIT_PATH,
+        settings.git_path,
         service_name,
         *arguments,
         stdout=subprocess.PIPE,
@@ -136,17 +162,17 @@ def get_refspecs(pkts: Sequence[PktLine]) -> list[bytes]:
     for pkt in pkts:
         if not isinstance(pkt, PktLineData):
             continue
-        if not pkt.data.startswith(b'ref-prefix '):
+        if not pkt.data.startswith(REF_PREFIX):
             continue
-        ref_prefix = pkt.data.removeprefix(b'ref-prefix ').rstrip()
+        ref_prefix = pkt.data.removeprefix(REF_PREFIX).rstrip()
         result.append(b'%b*:%b*' % (ref_prefix, ref_prefix))
     return result
         
-async def update_refs(repo_path: str, refspecs: list[bytes]) -> None:
-    logger.warning(f"Fetching refspecs: {refspecs}")
+async def update_refs(repo_path: Path, refspecs: list[bytes]) -> None:
+    logger.info(f"Fetching refspecs: {refspecs}")
     git_process = await asyncio.create_subprocess_exec(
-        GIT_PATH,
-        f"--git-dir={repo_path}",
+        settings.git_path,
+        f"--git-dir={repo_path.as_posix()}",
         "fetch",
         "origin",
         '--quiet',
@@ -165,12 +191,12 @@ async def update_refs(repo_path: str, refspecs: list[bytes]) -> None:
         raise Exception(f'git fetch terminated with non-zero result {return_code}')
 
 
-@app.post("/github.com/{repo:git_repo}/git-upload-pack")
-async def git_upload_pack(repo: str, request: Request) -> Response:
-    repo_path = path_to_repo(repo)
+@app.post("/{namespace}/{repo:git_repo}/git-upload-pack")
+async def git_upload_pack(namespace: str, repo: str, request: Request) -> Response:
+    local_repo = get_local_repo(namespace, repo)
     body = await decode_body(request)
-    logger.info(f"Request headers: {request.headers}")
-    logger.info(f"Raw body: {body}")
+    logger.info("Request headers: %s", request.headers)
+    logger.debug("Decoded body: %s", body)
     pkts, remainder = parse_pkt_lines(body)
 
     if len(remainder) > 0:
@@ -185,13 +211,13 @@ async def git_upload_pack(repo: str, request: Request) -> Response:
         # Consider a cache before refetching
         refspecs = get_refspecs(pkts)
         if len(refspecs) > 0:
-            await update_refs(repo_path, refspecs)
+            await update_refs(local_repo, refspecs)
 
     git_process = await asyncio.create_subprocess_exec(
-        GIT_PATH,
+        settings.git_path,
         'upload-pack',
         '--stateless-rpc',
-        repo_path,
+        local_repo.as_posix(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         env={
