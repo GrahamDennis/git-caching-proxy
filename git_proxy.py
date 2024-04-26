@@ -89,7 +89,7 @@ class RepoKey:
 
 @app.get("/github.com/{organisation}/{repo}/info/refs")
 async def list_references(organisation: str, repo: str, request: Request, service: Optional[str] = None) -> Response:
-    logger.warning(f"Headers: {request.headers}")
+    logger.info(f"Headers: {request.headers}")
     repo_key = RepoKey(organisation=organisation, repo=repo)
     content = _CACHED_REPO_REFERENCES.get(repo_key)
     if content is None:
