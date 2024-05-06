@@ -5,7 +5,7 @@ import gzip
 import logging
 from pathlib import Path
 import subprocess
-from typing import Annotated, Optional, Sequence, Type
+from typing import Annotated, Optional, Sequence, Type, Union
 from fastapi.responses import Response, StreamingResponse
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict, YamlConfigSettingsSource
 from starlette.convertors import Convertor, register_url_convertor
@@ -71,7 +71,7 @@ class PktLineConstants(Enum):
 class PktLineData:
     data: bytes
 
-PktLine = PktLineData | PktLineConstants
+PktLine = Union[PktLineData, PktLineConstants]
 
 
 def parse_pkt_lines(data: bytes) -> tuple[list[PktLine], bytes]:
