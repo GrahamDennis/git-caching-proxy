@@ -43,7 +43,7 @@ REF_PREFIX = b'ref-prefix '
 logger = logging.getLogger(__name__)
 
 class GitRepoConvertor(Convertor[str]):
-    regex = ".*\.git(?=$|/)"
+    regex = ".*(?=$|/)"
 
     def convert(self, value: str) -> str:
         return str(value)
@@ -117,7 +117,7 @@ def get_remote_repo(namespace: str, repo: str) -> str:
     return remote_repo_prefix + repo
 
 
-@app.get("/{namespace}/{repo:git_repo}/info/refs")
+@app.get("/git/{namespace}/{repo:git_repo}/info/refs")
 async def git_info_refs(namespace: str, repo: str, service: Optional[bytes] = None) -> Response:
     if not service == b'git-upload-pack':
         raise HTTPException(status_code=400, detail=f"Unsupported service '{service}'")
@@ -191,7 +191,7 @@ async def update_refs(repo_path: Path, refspecs: list[bytes]) -> None:
         raise Exception(f'git fetch terminated with non-zero result {return_code}')
 
 
-@app.post("/{namespace}/{repo:git_repo}/git-upload-pack")
+@app.post("/git/{namespace}/{repo:git_repo}/git-upload-pack")
 async def git_upload_pack(namespace: str, repo: str, request: Request) -> Response:
     local_repo = get_local_repo(namespace, repo)
     body = await decode_body(request)
@@ -234,4 +234,3 @@ async def git_upload_pack(namespace: str, repo: str, request: Request) -> Respon
         media_type='application/x-git-upload-pack-result',
         headers=NO_CACHE_HEADERS
     )
-
